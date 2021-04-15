@@ -125,7 +125,7 @@
   file.close();
 */
 
-#define MINIARCHIVER_VERSION 6
+#define MINIARCHIVER_VERSION 10
 
 // defines for a binary file data types
 #define STREAM_TYPE_UNCOMPRESSED		0
@@ -133,8 +133,9 @@
 #define STREAM_TYPE_ENCODED				2
 
 // optionals:
-// enable load/save of std::string, std::pair, std::vector, std::map, std::shared_ptr
-#define MINIARCHIVER_USE_STL 1
+// enable load/save of std::string, std::array, std::bitset, std::pair, std::vector, std::map, std::shared_ptr
+#define MINIARCHIVER_USE_STL	1
+#define MINI_ARCHIVER_USE_ZLIB	1
 //#define _DEBUG_OUT
 
 #include <iostream>
@@ -142,17 +143,35 @@
 #include <type_traits>
 #include <typeinfo>
 #include <string>
+#ifdef __GNUC__
+#ifdef __MINGW32__
+#include <cstring>
+#include <memory>
+#endif
+#endif
 
 #if defined MINIARCHIVER_USE_STL
 #include <vector>
 #include <map>
+#include <array>
+#include <bitset>
 #endif
 
-#if defined ZLIB_H
+#if defined MINI_ARCHIVER_USE_ZLIB
 #include <sstream>
+#include <zlib.h>
 #endif
 
 #pragma warning(disable : 5033)
+
+enum class LoadState {
+    LoadOk,
+    SaveOk,
+    CantOpenFailed,
+    FileEncoded,
+    WrongKey
+};
+
 
 using binary_vector = std::vector<unsigned char>;
 
@@ -186,6 +205,9 @@ CallSerialize(DataType& t, ArchiveType& ar, unsigned version) {
 namespace mini_archiver {
 	template <typename DataType>
 	DataType& make_nvp(const std::string& name, DataType& value) {
+#if defined _DEBUG_OUT
+	    std:: cout << name.c_str() << ": " << sizeof(value) << std::endl;
+#endif
 		return value;
 	}
 	template <typename DataType>
@@ -204,20 +226,49 @@ class ArchiveBase {
 protected:
 	int version_ = MINIARCHIVER_VERSION;
 public:
-	virtual ~ArchiveBase() = default;
+    ArchiveBase() = default;
+    virtual ~ArchiveBase() = default;
 
 	int Version() {
 		return version_;
 	}
 	virtual bool IsLoader() = 0;
 protected:
+    unsigned short hash_ = 0;
+    binary_vector encode_table_;
+
 	template <typename DataType>
 	void archive_raw(DataType& data) {
 		archive((char*)&data, sizeof(DataType));
 	}
 
 	virtual void archive(char* ptr, unsigned size) = 0;
+
+#if defined MINI_ARCHIVER_USE_ZLIB
+    template<typename T>
+    unsigned short crc16(const unsigned char* data_p, T length){
+        unsigned char x;
+        unsigned short crc = 0xFFFF;
+
+        while (length--){
+            x = crc >> 8 ^ *data_p++;
+            x ^= x>>4;
+            crc = (crc << 8) ^ ((unsigned short)(x << 12)) ^ ((unsigned short)(x <<5)) ^ ((unsigned short)x);
+        }
+        return crc;
+    }
+
+    void set_encode_table(const binary_vector& encode_table) {
+        encode_table_ = encode_table;
+        hash_ = crc16(encode_table_.data(), encode_table_.size());
+        // 0 is return value for bad hash, inc value
+        if( !hash_ ) hash_++;
+    }
+#endif
 };
+
+
+
 
 /*!
  * \class ArchiveOut
@@ -238,7 +289,8 @@ public:
 			CallSerialize(data, *this, Version());
 		else {
 #if defined _DEBUG_OUT
-			std::cout << "Saving fundamental '" << typeid(data).name() << "'" << std::endl;
+		   //auto name = std::string(typeid(data).name());
+			//std::cout << "Saving fundamental '" << name.c_str() << "' (" << sizeof(data) << ")" << std::endl;
 #endif
 			archive_raw<DataType>(data);
 		}
@@ -253,11 +305,49 @@ public:
 	}
 
 #if defined MINIARCHIVER_USE_STL
+    auto operator()(std::string& data) {
+#if defined _DEBUG_OUT
+        std::cout << "Saving '" << typeid(data).name() << "' (" << sizeof(data) << ")" << std::endl;
+#endif
+        unsigned size = static_cast<unsigned>(data.size());
+        archive_raw<unsigned>(size);
+        for (auto& elem : data) {
+            operator()(elem);
+        }
+        return this;
+    }
+
 	// special STL cases
+	template <typename std::size_t Size>
+	auto operator()(std::bitset<Size>& data) {
+#if defined _DEBUG_OUT
+		std::cout << "Saving bitset '" << typeid(data).name() << "' (" << sizeof(data) << ")" << std::endl;
+#endif
+		std::string d = data.to_string();
+		operator()(d);
+		return this;
+	}
+	
 	template <typename DataType>
 	auto operator()(std::vector<DataType>& data) {
 #if defined _DEBUG_OUT
-		std::cout << "Saving vector '" << typeid(data).name() << "'" << std::endl;
+		std::cout << "Saving vector '" << "' (" << sizeof(data) << ")" << std::endl;
+#endif
+		unsigned size = (unsigned)data.size();
+		archive_raw<unsigned>(size);
+
+		for (auto& elem : data) {
+			operator()(elem);
+		}
+
+		return this;
+	}
+	
+	// special STL cases
+	template <typename DataType, std::size_t Size>
+	auto operator()(std::array<DataType, Size>& data) {
+#if defined _DEBUG_OUT
+		std::cout << "Saving array '" << typeid(data).name() << "' (" << sizeof(data) << ")" << std::endl;
 #endif
 		unsigned size = (unsigned)data.size();
 		archive_raw<unsigned>(size);
@@ -272,29 +362,18 @@ public:
 	template <typename DataType>
 	auto operator()(std::shared_ptr<DataType>& data) {
 #if defined _DEBUG_OUT
-		std::cout << "Saving '" << typeid(data).name() << "'" << std::endl;
+		std::cout << "Saving '" << typeid(data).name() << "' (" << sizeof(data) << ")" << std::endl;
 #endif
 		operator()(*data);
 		return this;
 	}
 
-	auto operator()(std::string& data) {
-#if defined _DEBUG_OUT
-		std::cout << "Saving '" << typeid(data).name() << "'" << std::endl;
-#endif
-		unsigned size = (unsigned)data.size();
-		archive_raw<unsigned>(size);
-		for (auto& elem : data) {
-			operator()(elem);
-		}
-		return this;
-	}
 	template <typename DataType, typename DataType2>
 	auto operator()(std::map<DataType, DataType2>& data) {
 #if defined _DEBUG_OUT
-		std::cout << "Saving '" << typeid(data).name() << "'" << std::endl;
+		std::cout << "Saving '" << typeid(data).name() << "' (" << sizeof(data) << ")" << std::endl;
 #endif
-		unsigned size = (unsigned)data.size();
+		unsigned size = static_cast<unsigned>(data.size());
 		archive_raw<unsigned>(size);
 		for (auto& elem : data) {
 			operator()(elem);	// will call std::pair
@@ -329,6 +408,23 @@ public:
 		operator()(data.x, data.y, data.z, data.w);
 		return this;
 	}
+#else
+    // GLM loader/saver
+	template < typename DataType >
+	auto operator()(glm::tvec2<DataType>& data) {
+		operator()(data.x, data.y);
+		return this;
+	}
+	template < typename DataType >
+	auto operator()(glm::tvec3<DataType>& data) {
+		operator()(data.x, data.y, data.z);
+		return this;
+	}
+	template < typename DataType >
+	auto operator()(glm::tvec4<DataType>& data) {
+		operator()(data.x, data.y, data.z, data.w);
+		return this;
+	}
 #endif
 	virtual bool IsLoader() override {
 		return false;
@@ -354,7 +450,7 @@ public:
 			CallSerialize(data, *this, Version());
 		else {
 #if defined _DEBUG_OUT
-			std::cout << "Loading fundamental '" << typeid(data).name() << "'" << std::endl;
+			//std::cout << "Loading fundamental '" << typeid(data).name() << "' (" << sizeof(data) << ")" << std::endl;
 #endif
 			archive_raw<DataType>(data);
 		}
@@ -369,15 +465,54 @@ public:
 	}
 
 #if defined MINIARCHIVER_USE_STL
+    auto operator()(std::string& data) {
+#if defined _DEBUG_OUT
+        std::cout << "Loading '" << typeid(data).name() << "' (" << sizeof(data) << ")" << std::endl;
+#endif
+        unsigned size = 0;
+        archive_raw<unsigned>(size);
+        data.resize(size);
+        for (auto& elem : data) {
+            operator()(elem);
+        }
+        return this;
+    }
 	// special STL cases
+	template <typename std::size_t Size>
+	auto operator()(std::bitset<Size>& data) {
+#if defined _DEBUG_OUT
+		std::cout << "Loading bitset '" << typeid(data).name() << "' (" << sizeof(data) << ")" << std::endl;
+#endif
+		std::string string_bitset;
+		operator()(string_bitset);
+		
+		data = std::bitset<Size>(string_bitset);
+		return this;
+	}
+	
 	template <typename DataType>
 	auto operator()(std::vector<DataType>& data) {
 #if defined _DEBUG_OUT
-		std::cout << "Loading vector '" << typeid(data).name() << "'" << std::endl;
+		std::cout << "Loading vector '" << typeid(data).name() << "' (" << sizeof(data) << ")" << std::endl;
 #endif
 		unsigned size = 0;
 		archive_raw<unsigned>(size);
 		data.resize(size);
+		for (auto& elem : data) {
+			operator()(elem);
+		}
+
+		return this;
+	}
+
+	// special STL cases
+	template <typename DataType, std::size_t Size>
+	auto operator()(std::array<DataType, Size>& data) {
+#if defined _DEBUG_OUT
+		std::cout << "Loading array '" << typeid(data).name() << "' (" << Size << ")" << std::endl;
+#endif
+		unsigned size = 0;
+		archive_raw<unsigned>(size);
 		for (auto& elem : data) {
 			operator()(elem);
 		}
@@ -388,7 +523,7 @@ public:
 	template <typename DataType>
 	auto operator()(std::shared_ptr<DataType>& data) {
 #if defined _DEBUG_OUT
-		std::cout << "Loading '" << typeid(data).name() << "'" << std::endl;
+		std::cout << "Loading '" << typeid(data).name() << "' (" << sizeof(data) << ")" << std::endl;
 #endif
 		if (data == nullptr)
 			data = std::make_shared<DataType>();
@@ -396,22 +531,11 @@ public:
 		return this;
 	}
 
-	auto operator()(std::string& data) {
-#if defined _DEBUG_OUT
-		std::cout << "Loading '" << typeid(data).name() << "'" << std::endl;
-#endif
-		unsigned size = 0;
-		archive_raw<unsigned>(size);
-		data.resize(size);
-		for (auto& elem : data) {
-			operator()(elem);
-		}
-		return this;
-	}
+
 	template <typename DataType, typename DataType2>
 	auto operator()(std::map<DataType, DataType2>& data) {
 #if defined _DEBUG_OUT
-		std::cout << "Loading '" << typeid(data).name() << "'" << std::endl;
+		std::cout << "Loading '" << typeid(data).name() << "' (" << sizeof(data) << ")" << std::endl;
 #endif
 		unsigned size = 0;
 		archive_raw<unsigned>(size);
@@ -426,7 +550,7 @@ public:
 	template <typename DataType, typename DataType2>
 	auto operator()(std::pair<DataType, DataType2>& data) {
 #if defined _DEBUG_OUT
-		std::cout << "Loading '" << typeid(data).name() << "'" << std::endl;
+		std::cout << "Loading '" << typeid(data).name() << "' (" << sizeof(data) << ")" << std::endl;
 #endif
 		operator()(data.first, data.second);
 		return this;
@@ -450,6 +574,23 @@ public:
 		operator()(data.x, data.y, data.z, data.w);
 		return this;
 	}
+#else
+// GLM loader/saver
+    template < typename DataType >
+    auto operator()(glm::tvec2<DataType>& data) {
+        operator()(data.x, data.y);
+        return this;
+    }
+    template < typename DataType >
+    auto operator()(glm::tvec3<DataType>& data) {
+        operator()(data.x, data.y, data.z);
+        return this;
+    }
+    template < typename DataType >
+    auto operator()(glm::tvec4<DataType>& data) {
+        operator()(data.x, data.y, data.z, data.w);
+        return this;
+    }
 #endif
 
 	virtual bool IsLoader() override {
@@ -512,7 +653,7 @@ public:
 		std::vector<unsigned char>* ptr = this;
 		ar(*ptr);
 	}
-protected:
+//protected:
 	friend class BinaryIn;
 	virtual void archive(char* ptr, unsigned size) override	{
 		std::memcpy(ptr, &this->operator[](read_offset_), size);
@@ -530,79 +671,108 @@ class BinaryOut : public ArchiveOut, public std::ofstream {
 
 	const char* file_type_ = "AMF";
 	short stream_type_ = STREAM_TYPE_UNCOMPRESSED;
-#if defined ZLIB_H
+#if defined MINI_ARCHIVER_USE_ZLIB
 	OutputMemoryStream	data_stream_;	// used if compressed/encoded
-	binary_vector		encode_table_;
 #endif
 public:
-	BinaryOut(const char* fname, short stream_type = STREAM_TYPE_UNCOMPRESSED) :
+	BinaryOut(const char* fname, const binary_vector& encode_table, short stream_type = STREAM_TYPE_UNCOMPRESSED ) :
 		std::ofstream(fname, std::ios::binary) {
-		archive((char*)file_type_, 4);
-		archive_raw<int>(version_);
+
+		archive((char*)mini_archiver::make_nvp("MagicNumber",file_type_), 4);
+		archive_raw<int>(mini_archiver::make_nvp("Version", version_));
 
 		if (version_ >= 6) {
-#ifndef ZLIB_H
+#ifndef MINI_ARCHIVER_USE_ZLIB
 			// will be saved raw if there is no zlib header included
 			stream_type = STREAM_TYPE_UNCOMPRESSED;
 #endif
-			archive_raw<short>(stream_type);
+			archive_raw<short>(mini_archiver::make_nvp("StreamType", stream_type));
 		}
 
 		stream_type_ = stream_type;
+
+        if (stream_type_ & STREAM_TYPE_ENCODED)
+           set_encode_table(encode_table);
+
+        if( !hash_ ) hash_ = 1;
+
+        if( version_ >= 10 ) {
+            write_uncompressed(mini_archiver::make_nvp("Hash", hash_));
+        }
 	}
 	~BinaryOut() {
 		//flush();
+
 	}
 
-	short get_stream_type() const {
-		return stream_type_;
+    template<class DataType>
+	LoadState save(DataType& data ) {
+	    // this will either write to disk or to memory buffer if compressed
+	    operator ()(data);
+	    return LoadState::SaveOk;
 	}
+
+	void finalize() {
+        if (get_stream_type() & STREAM_TYPE_COMPRESSED) {
+            // here we will compress memory buffer (and eventuallye ncode it)
+            compress_and_save();
+        }
+	}
+private:
+
+    short get_stream_type() const {
+        return stream_type_;
+    }
 
 	// compress data and send compressed data to disk
 	void compress_and_save() {
-		if (is_open() && stream_type_ != STREAM_TYPE_UNCOMPRESSED) {
-			// we have memory data stored
-#if defined ZLIB_H
-			if (stream_type_ & STREAM_TYPE_COMPRESSED) {
-				// we are writing from now to disk
-				bool encoded = stream_type_ & STREAM_TYPE_ENCODED;
 
-				stream_type_ = STREAM_TYPE_UNCOMPRESSED;
-				
-				uLong stream_size = data_stream_.size();
-				uLong computed_size = compressBound(stream_size);
-				binary_vector processed_data(computed_size);
-				// Deflate
-				int error = compress((Bytef *)processed_data.data(), &computed_size, data_stream_.data(), stream_size);
-				// here if error code is Z_OK the variable compSize contains size of
-				// compressed data that is usually smaller than initial buffer size.
-				// vector size may be adjusted to actual size of compressed data
-				if (error == Z_OK) {
-					processed_data.resize(computed_size);
-					
-					if (encoded) {
-						for (size_t i = 2; i < processed_data.size(); i++) {
-							processed_data[i] += encode_table_[(i + stream_size) % encode_table_.size()];
-						}
-					}
-					operator()(processed_data);
-					archive_raw(stream_size);	// unpacked size
-				}
-			}
+		if (is_open() && stream_type_ & STREAM_TYPE_COMPRESSED) {
+			// we have memory data stored
+#if defined MINI_ARCHIVER_USE_ZLIB
+            // we are writing from now to disk
+            auto stream_type_old = stream_type_;
+
+            stream_type_ = STREAM_TYPE_UNCOMPRESSED;
+
+            uLong stream_size = (uLong)data_stream_.size();
+            uLong computed_size = compressBound(stream_size);
+            binary_vector processed_data(computed_size);
+            // Deflate
+            int error = compress((Bytef *)processed_data.data(), &computed_size, data_stream_.data(), stream_size);
+            // here if error code is Z_OK the variable compSize contains size of
+            // compressed data that is usually smaller than initial buffer size.
+            // vector size may be adjusted to actual size of compressed data
+            if (error == Z_OK) {
+                processed_data.resize(computed_size);
+
+                if (stream_type_old & STREAM_TYPE_ENCODED) {
+                    for (size_t i = 2; i < processed_data.size(); i++) {
+                        processed_data[i] += encode_table_[(i + stream_size) % encode_table_.size()];
+                    }
+                }
+
+                operator()(processed_data);
+                archive_raw(stream_size);	// unpacked size
+            }
+
+            stream_type_ = stream_type_old;
 #endif
 		}
 	}
-#if defined ZLIB_H
-	void set_encode_table(const binary_vector& encode_table) {
-		encode_table_ = encode_table;
-	}
-#endif
-protected:
 
+protected:
+    template <typename DataType>
+    void write_uncompressed(DataType& data) {
+        auto stream_old = stream_type_;
+        stream_type_ = STREAM_TYPE_UNCOMPRESSED;
+        archive_raw(data);
+        stream_type_ = stream_old;
+    }
 	void archive(char* ptr, unsigned size) override {
 		if (stream_type_ == STREAM_TYPE_UNCOMPRESSED)
 			write(ptr, size);
-#if defined ZLIB_H
+#if defined MINI_ARCHIVER_USE_ZLIB
 		else
 			data_stream_.archive(ptr, size);
 #endif
@@ -618,35 +788,69 @@ protected:
 class BinaryIn : public ArchiveIn, public std::ifstream {
 	char file_type_[4];
 	short stream_type_ = 0;
-#if defined ZLIB_H
+#if defined MINI_ARCHIVER_USE_ZLIB
 	InputMemoryStream	data_stream_;
-	binary_vector		encode_table_;
 #endif
 public:
-	BinaryIn(const std::string& file_path) :
+	BinaryIn(const std::string& file_path, const binary_vector& encode_table) :
 		std::ifstream(file_path, std::ios::binary)
 	{
-		archive((char*)file_type_, 4);
-		archive_raw<int>(version_);
+		archive((char*)mini_archiver::make_nvp("MagicNumber",file_type_), 4);
+		archive_raw<int>(mini_archiver::make_nvp("Version",version_));
 
 		if (version_ >= 6) {
-			archive_raw<short>(stream_type_);
+			archive_raw<short>(mini_archiver::make_nvp("StreamType",stream_type_));
 		}
+
+		if( stream_type_ & STREAM_TYPE_ENCODED )
+            set_encode_table(encode_table);
 	}
 
-	void read_compressed_data() {
-		if (stream_type_ != STREAM_TYPE_UNCOMPRESSED) {
-			short stream_type = stream_type_;
-			
+    template <typename DataType>
+	LoadState load(DataType& data) {
+
+        auto ret = pre_load();
+        if( ret == LoadState::LoadOk) {
+            operator()(data);
+            return LoadState::LoadOk;
+        }
+
+	    return ret;
+	}
+
+    LoadState pre_load() {
+
+        if (encode_table_.empty() && (stream_type_ & STREAM_TYPE_ENCODED) ) {
+            return LoadState::FileEncoded;
+        }
+
+        if( version_ >= 10 ) {
+            read_uncompressed(mini_archiver::make_nvp("Hash",hash_));
+        }
+
+        if (stream_type_ & STREAM_TYPE_COMPRESSED) {
+            if (read_compressed_data() == 0)
+                return LoadState::WrongKey;
+        }
+
+        return LoadState::LoadOk;
+    }
+private:
+
+	unsigned short read_compressed_data() {
+
+		if (stream_type_ & STREAM_TYPE_COMPRESSED) {
+			short saved_stream_type = stream_type_;
 			stream_type_ = STREAM_TYPE_UNCOMPRESSED;
-#if defined ZLIB_H
+
+#if defined MINI_ARCHIVER_USE_ZLIB
 			InputMemoryStream	mem;
 			mem.Serialize(*this, Version());
 
 			uLong original_size = 0;
-			archive_raw(original_size);	// load unpacked size
+			archive_raw(mini_archiver::make_nvp("OriginalSize",original_size));	// load unpacked size
 
-			if (stream_type & STREAM_TYPE_ENCODED) {
+			if (saved_stream_type & STREAM_TYPE_ENCODED) {
 				for (size_t i = 2; i < mem.size(); i++) {
 					mem[i] -= encode_table_[(i + original_size) % encode_table_.size()];
 				}
@@ -654,29 +858,34 @@ public:
 
 			binary_vector processed_data(original_size);
 
-			int error = uncompress((Bytef *)processed_data.data(), &original_size, mem.data(), mem.size());
+			int error = uncompress((Bytef *)processed_data.data(), &original_size, mem.data(), (uLong)mem.size());
 
 			if (error == Z_OK) {
 				data_stream_.swap(processed_data);
 			}
 #endif
-			stream_type_ = stream_type;
+			stream_type_ = saved_stream_type;
 		}
+
+		return hash_;
 	}
 
 	short get_stream_type() const {
 		return stream_type_;
 	}
-#if defined ZLIB_H
-	void set_encode_table(const binary_vector& encode_table ) {
-		encode_table_ = encode_table;
-	}
-#endif
+
 protected:
-	void archive(char* ptr, unsigned size) override {
+    template <typename DataType>
+    void read_uncompressed(DataType& data) {
+        auto stream_old = stream_type_;
+        stream_type_ = STREAM_TYPE_UNCOMPRESSED;
+        archive_raw(data);
+        stream_type_ = stream_old;
+	}
+	void archive(char* ptr, unsigned size ) override {
 		if(stream_type_ == STREAM_TYPE_UNCOMPRESSED )
 			read(ptr, size);
-#if defined ZLIB_H
+#if defined MINI_ARCHIVER_USE_ZLIB
 		else
 			data_stream_.archive(ptr, size);
 #endif
